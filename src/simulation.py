@@ -4,13 +4,12 @@ import pandas as pd
 import numpy as np
 
 CLEANED_DATA_PATH = "data/cleaned_data.xlsx"
+DOCTOR_PARAMS_PATH = "data/doctor_params.xlsx"
 
 RANDOM_SEED = 42
 SIM_TIME = 8 * 60  # 8 hours in minutes
 
-NUM_DOCTORS = 3
 NUM_XRAY_ROOMS = 1
-
 WALKIN_INTERARRIVAL_MEAN = 10  # adjustable
 
 
@@ -20,113 +19,124 @@ def create_schedule_1():
     return morning + afternoon
 
 
-def load_parameters():
-    df = pd.read_excel(CLEANED_DATA_PATH)
-
-    exam_mean = df["EXAM_DURATION_MIN"].mean()
-
-    xray_prob = df["HAS_XRAY"].mean()
-
-    # XRAY_FLOW_MIN includes waiting + service in real data.
-    # To avoid double-counting queueing in simulation, use a smaller proxy service time.
-    # We take a conservative service approximation from the lower quantiles.
-    xray_patients = df.loc[df["HAS_XRAY"] == 1, "XRAY_FLOW_MIN"].dropna()
-
-    if len(xray_patients) > 0:
-        xray_service_proxy = min(xray_patients.median() * 0.4, 12.0)
-        xray_flow_mean = xray_patients.mean()
-    else:
-        xray_service_proxy = 8.0
-        xray_flow_mean = np.nan
-
-    appointment_delay = None
-    if "APPOINTMENT_DELAY_MIN" in df.columns:
-        valid_appt_delay = df["APPOINTMENT_DELAY_MIN"].dropna()
-        if len(valid_appt_delay) > 0:
-            appointment_delay = valid_appt_delay
-
-    print("Loaded simulation parameters:")
-    print(f"Average exam duration: {exam_mean:.2f} min")
-    print(f"Observed X-ray probability: {xray_prob:.4f}")
-    print(f"Observed X-ray flow mean: {xray_flow_mean:.2f} min" if not np.isnan(xray_flow_mean) else "Observed X-ray flow mean: N/A")
-    print(f"Chosen X-ray service proxy: {xray_service_proxy:.2f} min")
-
-    return {
-        "exam_mean": max(exam_mean, 1.0),
-        "xray_prob": float(xray_prob),
-        "xray_service_mean": max(xray_service_proxy, 1.0),
-        "appointment_delay_samples": appointment_delay,
-    }
-
-
 def sample_nonnegative_exponential(mean_value):
     return random.expovariate(1 / max(mean_value, 0.01))
 
 
-def sample_appointment_delay(delay_series):
-    if delay_series is None or len(delay_series) == 0:
+def load_parameters():
+    cleaned_df = pd.read_excel(CLEANED_DATA_PATH)
+    doctor_df = pd.read_excel(DOCTOR_PARAMS_PATH)
+
+    appointment_delay_samples = None
+    if "APPOINTMENT_DELAY_MIN" in cleaned_df.columns:
+        valid_delays = cleaned_df["APPOINTMENT_DELAY_MIN"].dropna()
+        if len(valid_delays) > 0:
+            appointment_delay_samples = valid_delays.tolist()
+
+    doctor_records = []
+    for _, row in doctor_df.iterrows():
+        doctor_records.append({
+            "doctor_name": str(row["DOKTOR_ADI"]),
+            "patient_count": int(row["patient_count"]),
+            "exam_mean": float(row["exam_mean"]),
+            "xray_prob": float(row["xray_prob"]),
+            "xray_service_mean": float(row["xray_service_mean"]),
+        })
+
+    total_weight = sum(d["patient_count"] for d in doctor_records)
+
+    print("Loaded doctor-based parameters:")
+    print(f"Doctors in simulation: {len(doctor_records)}")
+    print(f"Total doctor weight: {total_weight}")
+
+    return {
+        "appointment_delay_samples": appointment_delay_samples,
+        "doctor_records": doctor_records,
+    }
+
+
+def sample_appointment_delay(delay_samples):
+    if not delay_samples:
         return 0.0
-    value = float(random.choice(delay_series.tolist()))
+    value = float(random.choice(delay_samples))
     return max(value, 0.0)
 
 
 class HospitalSimulation:
-    def __init__(self, env, num_doctors, num_xray_rooms, params):
+    def __init__(self, env, params):
         self.env = env
-        self.doctors = simpy.Resource(env, capacity=num_doctors)
-        self.xray = simpy.Resource(env, capacity=num_xray_rooms)
         self.params = params
+
+        self.xray = simpy.Resource(env, capacity=NUM_XRAY_ROOMS)
+
+        # one resource per doctor
+        self.doctor_resources = {
+            d["doctor_name"]: simpy.Resource(env, capacity=1)
+            for d in params["doctor_records"]
+        }
 
         self.waiting_times_doctor = []
         self.waiting_times_xray = []
         self.total_system_times = []
 
-        self.queue_length_doctor_snapshots = []
         self.queue_length_xray_snapshots = []
+        self.doctor_queue_snapshots = []
 
         self.completed_patients = 0
         self.completed_xray_patients = 0
 
+    def choose_doctor(self):
+        doctors = self.params["doctor_records"]
+        weights = [d["patient_count"] for d in doctors]
+        chosen = random.choices(doctors, weights=weights, k=1)[0]
+        return chosen
+
     def monitor_queues(self):
         while True:
-            self.queue_length_doctor_snapshots.append(len(self.doctors.queue))
             self.queue_length_xray_snapshots.append(len(self.xray.queue))
+
+            total_doctor_queue = sum(len(res.queue) for res in self.doctor_resources.values())
+            self.doctor_queue_snapshots.append(total_doctor_queue)
+
             yield self.env.timeout(1)
 
     def patient(self, patient_id, patient_type="walkin"):
         arrival_time = self.env.now
+        doctor_info = self.choose_doctor()
+        doctor_name = doctor_info["doctor_name"]
+        doctor_res = self.doctor_resources[doctor_name]
 
-        # Initial doctor visit
+        # first exam with assigned doctor
         doctor_queue_entry = self.env.now
-        with self.doctors.request() as req:
+        with doctor_res.request() as req:
             yield req
             doctor_wait = self.env.now - doctor_queue_entry
             self.waiting_times_doctor.append(doctor_wait)
 
-            exam_time = sample_nonnegative_exponential(self.params["exam_mean"])
+            exam_time = sample_nonnegative_exponential(doctor_info["exam_mean"])
             yield self.env.timeout(exam_time)
 
-        # X-ray decision
-        if random.random() < self.params["xray_prob"]:
+        # xray decision depends on same doctor's historical pattern
+        if random.random() < doctor_info["xray_prob"]:
             xray_queue_entry = self.env.now
             with self.xray.request() as req:
                 yield req
                 xray_wait = self.env.now - xray_queue_entry
                 self.waiting_times_xray.append(xray_wait)
 
-                xray_service_time = sample_nonnegative_exponential(self.params["xray_service_mean"])
+                xray_service_time = sample_nonnegative_exponential(doctor_info["xray_service_mean"])
                 yield self.env.timeout(xray_service_time)
 
             self.completed_xray_patients += 1
 
-            # Secondary screening (same doctor pool; exact same doctor identity not modeled yet)
+            # secondary screening with SAME doctor
             doctor_queue_entry_2 = self.env.now
-            with self.doctors.request() as req:
+            with doctor_res.request() as req:
                 yield req
                 doctor_wait_2 = self.env.now - doctor_queue_entry_2
                 self.waiting_times_doctor.append(doctor_wait_2)
 
-                second_exam_time = sample_nonnegative_exponential(self.params["exam_mean"] / 2)
+                second_exam_time = sample_nonnegative_exponential(max(doctor_info["exam_mean"] / 2, 1.0))
                 yield self.env.timeout(second_exam_time)
 
         total_system_time = self.env.now - arrival_time
@@ -143,13 +153,9 @@ class HospitalSimulation:
 
     def appointment_generator(self, schedule_minutes):
         for i, scheduled_time in enumerate(schedule_minutes, start=1):
-            # Move to scheduled time
             yield self.env.timeout(max(0, scheduled_time - self.env.now))
-
-            # Arrival randomness around schedule
             delay = sample_appointment_delay(self.params["appointment_delay_samples"])
             yield self.env.timeout(delay)
-
             self.env.process(self.patient(f"A{i}", patient_type="appointment"))
 
     def print_results(self):
@@ -169,9 +175,9 @@ class HospitalSimulation:
             print(f"Average total system time: {np.mean(self.total_system_times):.2f} min")
             print(f"Maximum total system time: {np.max(self.total_system_times):.2f} min")
 
-        if self.queue_length_doctor_snapshots:
-            print(f"Average doctor queue length: {np.mean(self.queue_length_doctor_snapshots):.2f}")
-            print(f"Maximum doctor queue length: {np.max(self.queue_length_doctor_snapshots):.2f}")
+        if self.doctor_queue_snapshots:
+            print(f"Average total doctor queue length: {np.mean(self.doctor_queue_snapshots):.2f}")
+            print(f"Maximum total doctor queue length: {np.max(self.doctor_queue_snapshots):.2f}")
 
         if self.queue_length_xray_snapshots:
             print(f"Average X-ray queue length: {np.mean(self.queue_length_xray_snapshots):.2f}")
@@ -182,14 +188,8 @@ def main():
     random.seed(RANDOM_SEED)
 
     params = load_parameters()
-
     env = simpy.Environment()
-    hospital = HospitalSimulation(
-        env=env,
-        num_doctors=NUM_DOCTORS,
-        num_xray_rooms=NUM_XRAY_ROOMS,
-        params=params,
-    )
+    hospital = HospitalSimulation(env, params)
 
     appointment_schedule = create_schedule_1()
 
